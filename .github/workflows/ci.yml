@@ -309,7 +309,10 @@ jobs:
       # longer tell whether admission works.
       - name: The disk-full smoke fails with write admission off
         run: |
-          if ADMISSION=off bash clients/smoke/run-disk-full.sh > /tmp/disk-full-control.log 2>&1; then
+          # 60 s is plenty: with admission on, the first refusal comes within
+          # seconds, and with it off the smoke runs to MAX_SECS and fails with
+          # "no write was refused". The default 300 s would cost 5 minutes.
+          if ADMISSION=off MAX_SECS=60 bash clients/smoke/run-disk-full.sh > /tmp/disk-full-control.log 2>&1; then
             cat /tmp/disk-full-control.log
             echo "CONTROL FAIL: the disk-full smoke passed with write admission off"
             exit 1
