@@ -26,6 +26,7 @@ jobs:
           make bootstrap
           PATH="$PWD/tools:$PATH" jhm orly/server/orlyi orly/server/import_replication.test
       - name: loop
+        shell: bash {0}
         run: |
           BIN=../out_orly/debug/orly/server/import_replication.test
           if [ "${{ matrix.load }}" = loaded ]; then
@@ -37,10 +38,9 @@ jobs:
           i=0; hits=0; fails=0
           while [ $(date +%s) -lt $end ]; do
             i=$((i+1))
-            (cd /tmp && timeout 600 $GITHUB_WORKSPACE/$BIN > /tmp/run.$i.log 2>&1); rc=$?
-            a=0; grep -q "update_remap" /tmp/run.$i.log && a=1
-            [ $a = 1 ] && hits=$((hits+1))
-            [ $rc != 0 ] && fails=$((fails+1))
+            rc=0; (cd /tmp && timeout 600 $GITHUB_WORKSPACE/$BIN > /tmp/run.$i.log 2>&1) || rc=$?
+            a=0; if grep -q "update_remap" /tmp/run.$i.log; then a=1; hits=$((hits+1)); fi
+            if [ $rc != 0 ]; then fails=$((fails+1)); fi
             echo "RESULT prune=${{ matrix.prune }} load=${{ matrix.load }} run=$i rc=$rc assert=$a"
             if [ $a = 1 ] || [ $rc != 0 ]; then
               grep -v "TRunnerCons\|TPool\|TLocklessPool\|SLOW RUNNER\|Scheduler TID" /tmp/run.$i.log | tail -150
