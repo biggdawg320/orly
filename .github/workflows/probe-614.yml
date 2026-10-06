@@ -1,0 +1,99 @@
+# Throwaway probe for #614: loop import_replication.test's
+# PrunedJoinWithoutFileSync fixture on native arm64 debug and catch the
+# StepMergeMem `iter != update_remap.end()` assertion with a core.
+name: probe-614
+
+on:
+  push:
+    branches: [ohohoreilly/probe-614]
+
+jobs:
+  hunt:
+    name: shot ${{ matrix.shot }} load ${{ matrix.load }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        shot: [1, 2, 3, 4, 5, 6]
+        load: [0, 3]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential gcc g++ uuid-dev libgmp-dev libaio-dev \
+            libsnappy-dev libreadline-dev libboost-system-dev zlib1g-dev \
+            bison flex valgrind gdb
+
+      - name: Build debug orlyi + import_replication.test
+        run: |
+          make bootstrap version
+          PATH="$PWD/tools:$PATH" jhm -c debug orly/server/orlyi orly/server/import_replication.test
+
+      - name: Enable core dumps
+        run: |
+          sudo mkdir -p /tmp/cores
+          sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
+
+      - name: Hunt
+        run: |
+          ulimit -c unlimited
+          for b in $(seq 1 ${{ matrix.load }}); do (while :; do :; done) & done
+          end=$(( $(date +%s) + 50*60 ))
+          i=0; caught=0; other=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            i=$((i+1))
+            s=$(date +%s)
+            rc=0
+            ONLY_PRUNED=1 timeout -s KILL 600 ../out_orly/debug/orly/server/import_replication.test > run.log 2>&1 || rc=$?
+            secs=$(( $(date +%s) - s ))
+            if grep -q "update_remap" run.log; then
+              caught=$((caught+1))
+              echo "::error::CAUGHT #614 on iteration $i (${secs}s)"
+              grep -n "Assertion\|tail of\|end Pruned\|exception" run.log | head -20
+              cp run.log caught-$i.log
+            elif [ "$rc" -ne 0 ]; then
+              other=$((other+1))
+              echo "iteration $i: rc=$rc (${secs}s), not #614:"
+              grep -n "Assertion\|exception\|end Pruned\|killed\|signal" run.log | head -8
+              cp run.log other-$i.log
+            else
+              echo "iteration $i: pass (${secs}s)"
+            fi
+            if [ "$caught" -gt 0 ]; then break; fi
+          done
+          echo "SUMMARY shot=${{ matrix.shot }} load=${{ matrix.load }} iterations=$i caught=$caught other=$other"
+          [ "$caught" -eq 0 ]
+
+      - name: Symbolize cores
+        if: always()
+        run: |
+          shopt -s nullglob
+          for core in /tmp/cores/core.*; do
+            echo "================ $core"
+            gdb -batch -ex 'info threads' -ex 'thread apply all bt 25' \
+              ../out_orly/debug/orly/server/orlyi "$core" 2>&1 | grep -v "^\[New LWP" | head -600
+            echo "---- StepMergeMem frame"
+            gdb -batch \
+              -ex 'thread apply all bt 1' \
+              -ex 'frame function Orly::Indy::TRepo::StepMergeMem' \
+              -ex 'info locals' \
+              -ex 'p *this' \
+              -ex 'p mem_to_merge_vec' \
+              -ex 'p lower_seq_bound' \
+              ../out_orly/debug/orly/server/orlyi "$core" 2>&1 | tail -200
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-614-${{ matrix.shot }}-${{ matrix.load }}
+          path: |
+            caught-*.log
+            other-*.log
+          if-no-files-found: ignore

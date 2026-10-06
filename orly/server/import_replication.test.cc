@@ -769,6 +769,7 @@ string GetOrlyiPath() {
 }  // anonymous namespace
 
 FIXTURE(ImportReplication) {
+  if (getenv("ONLY_PRUNED")) return;  // probe-614 only
   Orly::Type::TTypeCzar type_czar;
   const string scratch = GetScratchDir();
   const string orlyi_path = GetOrlyiPath();
@@ -1074,6 +1075,7 @@ FIXTURE(PrunedJoinWithoutFileSync) {
    TConnection releases the session's durable ptr before Clear() runs,
    instead of Clear() logging-and-leaking the still-ptr'd session (#460). */
 FIXTURE(GracefulShutdownUnresponsiveSlave) {
+  if (getenv("ONLY_PRUNED")) return;  // probe-614 only
   Orly::Type::TTypeCzar type_czar;
   const string scratch = GetScratchDir();
   const string orlyi_path = GetOrlyiPath();
