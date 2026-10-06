@@ -71,9 +71,6 @@ TRepoTetrisManager::TPlayer::TPlayer(TRepoTetrisManager *repo_tetris_manager, co
 
 TRepoTetrisManager::TPlayer::~TPlayer() {
   assert(ChildByPovId.size() == 1UL);
-  for (const auto &item: ChildByPovId) {
-    delete item.second;
-  }
 }
 
 TRepoTetrisManager::TPlayer::TChild::TChild(TPlayer *player, const TUuid &child_pov_id)
@@ -264,20 +261,15 @@ bool TRepoTetrisManager::TPlayer::TChild::IsAssertionFree() const {
 
 void TRepoTetrisManager::TPlayer::OnJoin(const TUuid &child_pov_id) {
   lock_guard<mutex> lock(Mutex);
-  auto child = new TChild(this, child_pov_id);
-  try {
-    ChildByPovId.insert(make_pair(child_pov_id, child));
-  } catch (...) {
-    delete child;
-    throw;
-  }
+  ChildByPovId.insert(make_pair(child_pov_id, shared_ptr<TChild>(new TChild(this, child_pov_id))));
 }
 
 void TRepoTetrisManager::TPlayer::OnPart(const TUuid &child_pov_id) {
   lock_guard<mutex> lock(Mutex);
   auto iter = ChildByPovId.find(child_pov_id);
   if (iter != ChildByPovId.end()) {
-    delete iter->second;
+    /* Just erase the map's reference: if Play() copied this child's shared_ptr out for the round
+       that is still underway, the object lives on until that copy goes away too (#636). */
     ChildByPovId.erase(iter);
   }
 }
@@ -297,13 +289,13 @@ void TRepoTetrisManager::TPlayer::Play() {
        nothing to discard, and it is the transaction the assertion-bearing
        (one-per-round) promotion below reuses. */
     unique_ptr<Indy::L1::TTransaction, function<void (Indy::L1::TTransaction *)>> snapshot_txn = RepoTetrisManager->RepoManager->NewTransaction();
-    vector<TChild *> children;
+    vector<shared_ptr<TChild>> children;
     snapshot_timer.Start();
     /* extra */ {
       lock_guard<mutex> lock(Mutex);
       children.reserve(ChildByPovId.size());
       for (const auto &item: ChildByPovId) {
-        TChild *child = item.second;
+        const auto &child = item.second;
         if (child->Refresh(snapshot_txn)) {
           children.push_back(child);
         }
@@ -313,7 +305,9 @@ void TRepoTetrisManager::TPlayer::Play() {
     RepoTetrisManager->ChildrenConsideredCount += children.size();
     /* Sort by decreasing promote-ness. */
     sort_timer.Start();
-    sort(children.begin(), children.end(), TChild::SortsBefore);
+    sort(children.begin(), children.end(), [](const shared_ptr<TChild> &lhs, const shared_ptr<TChild> &rhs) {
+      return TChild::SortsBefore(lhs.get(), rhs.get());
+    });
     sort_timer.Stop();
 
     play_timer.Start();
@@ -333,7 +327,7 @@ void TRepoTetrisManager::TPlayer::Play() {
          RMW assertion is never evaluated against a parent the same round's
          commutative writes have already mutated. */
       bool promoted_commutative = false;
-      for (TChild *child: children) {
+      for (const auto &child: children) {
         if (child->IsAssertionFree()) {
           /* Promote on a dedicated transaction, re-Peeking the child on THAT
              transaction first. The snapshot-phase Peek attached to snapshot_txn
@@ -355,7 +349,7 @@ void TRepoTetrisManager::TPlayer::Play() {
         }  // txn destroyed here -> AppendUpdate applies the promotion
       }
       if (!promoted_commutative) {
-        for (TChild *child: children) {
+        for (const auto &child: children) {
           if (!child->IsAssertionFree() && child->Play(snapshot_txn, context)) {
             break;
           }
@@ -364,7 +358,7 @@ void TRepoTetrisManager::TPlayer::Play() {
     } else {
       /* Give each child a chance to play.  At most one will be permitted to
          promote (for now), but any number might fail due to age. */
-      for (TChild *child: children) {
+      for (const auto &child: children) {
         if (child->Play(snapshot_txn, context)) {
           break;
         }

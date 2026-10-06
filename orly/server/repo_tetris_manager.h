@@ -180,8 +180,11 @@ namespace Orly {
         /* Covers 'ChildByPovId', below. */
         std::mutex Mutex;
 
-        /* A mapping from a child pov id to the object managing our relationship with that child. */
-        std::unordered_map<Base::TUuid, TChild *> ChildByPovId;
+        /* A mapping from a child pov id to the object managing our relationship with that child.
+           Shared, not raw, so that Play() -- which copies entries out, releases Mutex, and keeps
+           using them -- isn't left holding a dangling pointer if a pause commits concurrently and
+           OnPart() erases the same entry out from under it (#636). */
+        std::unordered_map<Base::TUuid, std::shared_ptr<TChild>> ChildByPovId;
 
       };  // TRepoTetrisManager::TPlayer
 

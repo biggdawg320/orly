@@ -359,7 +359,6 @@ std::optional<TSequenceNumber> TRepo::AppendUpdate(TUpdate *update, TSequenceNum
 }
 
 std::optional<TSequenceNumber> TRepo::PopLowest(TSequenceNumber &next_update) NO_THROW {
-  assert(Status == Normal);
   assert(LowestSeqNum);
   assert(HighestSeqNum);
   std::optional<TSequenceNumber> popped_seq;
@@ -372,8 +371,13 @@ std::optional<TSequenceNumber> TRepo::PopLowest(TSequenceNumber &next_update) NO
     } else {
       LowestSeqNum.reset();
       HighestSeqNum.reset();
-      if (ParentRepo) {
-        assert(InTetris);
+      /* #636: a pause can commit (ChangeStatus -> Part) between the promotion
+         transaction's push-to-parent and this pop-from-child apply, in which
+         case Status is no longer Normal and InTetris is already false here.
+         The update was already delivered to the parent by the push half of
+         this same transaction, so draining it below is still correct -- it's
+         just not our job to Part a second time. */
+      if (ParentRepo && InTetris) {
         Manager->GetTetrisManager()->Part((*ParentRepo)->GetId(), GetId());
         InTetris = false;
       }
@@ -425,6 +429,11 @@ std::shared_ptr<TUpdate> TRepo::GetLowestUpdate() {
 }
 
 std::optional<TSequenceNumber> TRepo::ChangeStatus(TStatus status, TSequenceNumber &next_update) NO_THROW {
+  /* #636: Status, LowestSeqNum and InTetris are DataLock-guarded everywhere else
+     (AppendUpdate, PopLowest, GetLowestUpdate); flipping Status outside that lock
+     raced those readers. Hold DataLock for the whole function so the status
+     change and its Join/Part are atomic with the rest of the class's locking. */
+  std::lock_guard<std::mutex> lock(DataLock);
   switch (Status) {
     case Normal : {
       assert(status != Normal);  // you probably meant to unpause something. if it's not already paused you may have forgotten your pause!
@@ -444,7 +453,6 @@ std::optional<TSequenceNumber> TRepo::ChangeStatus(TStatus status, TSequenceNumb
   /* Tetris */
   switch (Status) {
     case Normal : {
-      std::lock_guard<std::mutex> lock(DataLock);
       if (!LowestSeqNum) {
         if (ParentRepo && !InTetris) {
           Manager->GetTetrisManager()->Join((*ParentRepo)->GetId(), GetId());

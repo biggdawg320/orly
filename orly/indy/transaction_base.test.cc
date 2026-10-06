@@ -48,6 +48,22 @@ Orly::Indy::Util::TPool TUpdate::TEntry::Pool(sizeof(TUpdate::TEntry), "Entry", 
 const std::vector<size_t> MemMergeCoreVec{0};
 const std::vector<size_t> DiskMergeCoreVec{0};
 
+/* Exposes TRepo::ChangeStatus (protected) for Issue636PauseMidPromotion, which needs to flip
+   a repo's status directly instead of through a second TTransaction: that fixture's hook runs
+   while the promoting transaction's own ~TTransaction already holds
+   Manager->GetReplicationQueueLock(), and a second transaction's commit would re-lock that same
+   non-recursive mutex on the same thread. */
+class TStatusSteppedFastRepo final
+    : public TFastRepo {
+  NO_COPY(TStatusSteppedFastRepo);
+  public:
+
+  using TFastRepo::TFastRepo;
+
+  using Orly::Indy::TRepo::ChangeStatus;
+
+};  // TStatusSteppedFastRepo
+
 class TMyManager
     : public L1::TManager {
   NO_COPY(TMyManager);
@@ -81,7 +97,7 @@ class TMyManager
                                      bool /*create*/) override {
     return is_safe ?
       static_cast<TRepo *>(new TSafeRepo(this, repo_id, *ttl, parent_repo))
-    : static_cast<TRepo *>(new TFastRepo(this, repo_id, *ttl, parent_repo));
+    : static_cast<TRepo *>(new TStatusSteppedFastRepo(this, repo_id, *ttl, parent_repo));
   }
 
   virtual void SaveRepo(Orly::Indy::L0::TManager::TRepo *) override {}
@@ -438,6 +454,81 @@ FIXTURE(Issue143PromotionWindow) {
 
     /* And after promotion the value lives in the parent and is still found. */
     EXPECT_TRUE(found_in_child_or_parent());
+
+    std::lock_guard<std::mutex> lock(mut);
+    fin = true;
+    cond.notify_one();
+  });
+}
+
+/* Issue #636: pausing a POV mid-promotion-round. TRepoTetrisManager::TPlayer::TChild::Play
+   pushes the peeked update to the parent and pops it from the child in one transaction
+   (repo_tetris_manager.cc: `transaction->Push(Player->Repo, PeekedUpdate); transaction->Pop(Repo);`).
+   If a pause for the child commits in the window between those two applies -- exactly what the
+   push/pop test-only commit hook models -- the child is already Paused by the time the pop
+   applies, and TRepo::PopLowest's `assert(Status == Normal)` fires. */
+FIXTURE(Issue636PauseMidPromotion) {
+  Fiber::TFiberTestRunner runner([](std::mutex &mut, std::condition_variable &cond, bool &fin, Fiber::TRunner::TRunnerCons &) {
+    TSuprena arena;
+    void *state_alloc = alloca(Sabot::State::GetMaxStateSize());
+    const TScheduler::TPolicy scheduler_policy(10, 10, 10ms);
+    TScheduler scheduler;
+    scheduler.SetPolicy(scheduler_policy);
+    Orly::Indy::Disk::Sim::TMemEngine mem_engine(&scheduler,
+                                                 256, 64, 128, 1, 64, 1);
+    auto manager = make_unique<TMyManager>(mem_engine.GetEngine(), &scheduler, MemMergeCoreVec, DiskMergeCoreVec);
+    Base::TUuid global_id(TUuid::Twister);
+    Base::TUuid child_id(TUuid::Twister);
+    Base::TUuid idx_id(TUuid::Twister);
+
+    /* Parent-less child, as in Issue143PromotionWindow: this drives the promotion and the
+       pause by hand, without pulling in a live Tetris player fiber. The assert under test
+       (TRepo::PopLowest) fires regardless of whether the repo has a parent. */
+    auto global_repo = manager->GetRepo(global_id, TTtl::max(), std::nullopt, false, true);
+    auto child_repo = manager->GetRepo(child_id, TTtl::max(), std::nullopt, false, true);
+    auto *stepped_child = dynamic_cast<TStatusSteppedFastRepo *>(child_repo.Get());
+    if (!EXPECT_TRUE(stepped_child != nullptr)) {
+      std::lock_guard<std::mutex> lock(mut);
+      fin = true;
+      cond.notify_one();
+      return;
+    }
+
+    const TIndexKey key(idx_id, TKey(make_tuple(1L), &arena, state_alloc));
+
+    /* commit push to child */ {
+      auto transaction = manager->NewTransaction();
+      auto update = TUpdate::NewUpdate(TUpdate::TOpByKey{ { key, TKey(7L, &arena, state_alloc)} }, TKey(&arena), TKey(Base::TUuid(TUuid::Best), &arena, state_alloc));
+      transaction->Push(child_repo, update);
+      transaction->Prepare();
+      transaction->CommitAction();
+    }
+
+    /* Install the test-only hook: fires inside the promotion commit, between the
+       push-to-parent apply and the pop-from-child apply -- the window the issue says a pause
+       lands in. Flip the status directly (as ~TStatusChanger would) rather than through a
+       second TTransaction: the promoting transaction's own ~TTransaction already holds
+       Manager->GetReplicationQueueLock() while this hook runs, and a second transaction's
+       commit would re-lock that same non-recursive mutex on this thread. */
+    L1::TTransaction::OnCommitBetweenPushAndPopForTest = [&]() {
+      TSequenceNumber next_update;
+      stepped_child->ChangeStatus(Paused, next_update);
+    };
+
+    /* Promote: pop the lowest from the child and push it to the parent, all in one
+       transaction, exactly as TChild::Play does. The pause above lands between the push and
+       the pop applies, so the pop below hits TRepo::PopLowest with the child already Paused. */
+    /* commit promotion */ {
+      auto transaction = manager->NewTransaction();
+      transaction->Pop(child_repo);
+      transaction->Push(global_repo, transaction->Peek(child_repo));
+      transaction->Prepare();
+      transaction->CommitAction();
+    }  // <-- ~TTransaction here applies push (parent), fires hook (pause), then pop (child)
+
+    L1::TTransaction::OnCommitBetweenPushAndPopForTest = nullptr;
+
+    EXPECT_EQ(child_repo->GetStatus(), Paused);
 
     std::lock_guard<std::mutex> lock(mut);
     fin = true;
