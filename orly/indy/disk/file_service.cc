@@ -321,15 +321,23 @@ TFileService::TFileService(Base::TScheduler *scheduler,
 
 TFileService::~TFileService() {
   ShuttingDown = true;
+  /* Cancel-or-join the job hosting BGScheduler's loop first (#462, #463): a host that never got
+     a worker can neither be waited for nor be allowed to start late against the dying members.
+     A failed cancel means the loop is running, so the runner fiber latched onto it will run:
+     wake it and wait for it to finish, which frees its own frame. A cancelled host never ran
+     that fiber, so nothing would free its frame, and the frame pool's destructor would later
+     terminate on it ("Stack frame was not unwound properly"); free it here, as
+     ~TDurableManager does for its fibers (#631). */
+  const bool hosted = SchedulerHostHandle && !Scheduler->Cancel(SchedulerHostHandle);
   RunSem.Push();
+  if (hosted) {
+    RunnerExitedSem.Pop();
+  }
   BGScheduler.ShutDown();
-  /* Cancel-or-join the job hosting BGScheduler's loop: the ShutDown()
-     above is only a flag, and member destruction below would otherwise
-     race a loop still on its way out (#463) -- while a host that never
-     got a worker can neither be waited for nor be allowed to start late
-     against the dying members (#462). */
-  if (SchedulerHostHandle && !Scheduler->Cancel(SchedulerHostHandle)) {
+  if (hosted) {
     SchedulerExitedSem.Pop();
+  } else {
+    Fiber::TFrame::LocalFramePool->Free(Frame);
   }
 }
 
@@ -661,10 +669,12 @@ void TFileService::Runner() {
   } catch (const std::exception &ex) {
     delete Disk::Util::TDiskController::TEvent::LocalEventPool;
     Disk::Util::TDiskController::TEvent::LocalEventPool = nullptr;
+    RunnerExitedSem.Push();
     throw;
   }
   delete Disk::Util::TDiskController::TEvent::LocalEventPool;
   Disk::Util::TDiskController::TEvent::LocalEventPool = nullptr;
+  RunnerExitedSem.Push();
   Fiber::FreeMyFrame(Fiber::TFrame::LocalFramePool);
 }
 
