@@ -51,6 +51,12 @@ using namespace Util;
    several POVs backing up at once still leave room for their merges. That
    loop always terminates, because every memtable drains.
 
+   The backlog is capped in entries too, at 1/32 of the Update Entry pool
+   (#628). The merge copies entries as well as updates, and a batch is a
+   single update with an entry per write, so a cap in updates alone let a
+   batching POV's backlog hold most of the Entry pool. A single update bigger
+   than the cap waits only until it is promoted itself.
+
    The second is the Update / Update Entry pools past half full, whatever
    holds them: merges need that much room to copy into. That wait is
    bounded, because the pools also hold data that drains slowly or never (a
@@ -67,6 +73,7 @@ static void ApplyWriteBackpressure(const Indy::L0::TManager::TPtr<Indy::TRepo> &
     return;
   }
   backlog_threshold = std::min(backlog_threshold, std::max<size_t>(Indy::TUpdate::GetUpdatePoolMaxBlocks() / 32, 1));
+  const size_t backlog_entry_threshold = std::max<size_t>(Indy::TUpdate::GetEntryPool().GetMaxBlocks() / 32, 1);
   constexpr double pool_threshold = 0.5;
   const auto pools_full = [wait_for_pools] {
     return wait_for_pools
@@ -76,6 +83,7 @@ static void ApplyWriteBackpressure(const Indy::L0::TManager::TPtr<Indy::TRepo> &
   const auto pool_deadline = steady_clock::now() + seconds(5);
   for (;;) {
     if (repo->GetMemBacklogDepth() > backlog_threshold
+        || repo->GetMemBacklogEntries() > backlog_entry_threshold
         || (pools_full() && steady_clock::now() < pool_deadline)) {
       Indy::Fiber::YieldSlow();
     } else {
