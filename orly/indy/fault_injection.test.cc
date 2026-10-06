@@ -1230,10 +1230,6 @@ static const vector<TExpectedFailure> ExpectedFailures{
      mapping assertion at manager_base.cc:46). */
   {"MergeDiskFold", "Power", "reopen", 618},
   {"MergeDiskFold", "PowerTorn", "reopen", 618},
-  /* #619: durable files enter the file map before their blocks are synced; startup aborts on
-     an acknowledged file. */
-  {"DurableSaveMerge", "Power", "reopen", 619},
-  {"DurableSaveMerge", "PowerTorn", "reopen", 619},
   /* #620: reload drops leftover merge inputs without freeing their blocks. */
   {"MergeDisk", "Power", "leak", 620},
   {"MergeDisk", "PowerTorn", "leak", 620},
