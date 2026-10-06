@@ -1,0 +1,50 @@
+# Throwaway: loop import_replication's PrunedJoinWithoutFileSync on arm runners (#614).
+# Reports RESULT lines instead of failing. Deleted with its branch.
+name: loop614
+on:
+  push:
+    branches: [ohohoreilly/loop614]
+jobs:
+  loop:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        prune: [on, off]
+        load: [idle, loaded]
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v6
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential gcc g++ uuid-dev libgmp-dev libaio-dev \
+            libsnappy-dev libreadline-dev libboost-system-dev zlib1g-dev bison flex valgrind
+      - name: build
+        run: |
+          make bootstrap
+          PATH="$PWD/tools:$PATH" jhm orly/server/orlyi orly/server/import_replication.test
+      - name: loop
+        run: |
+          BIN=../out_orly/debug/orly/server/import_replication.test
+          if [ "${{ matrix.load }}" = loaded ]; then
+            for i in $(seq 1 $(nproc)); do (while true; do :; done) & done
+          fi
+          if [ "${{ matrix.prune }}" = off ]; then export PRUNE_OFF=1; fi
+          export ONLY_PRUNED_JOIN=1
+          end=$(( $(date +%s) + 40*60 ))
+          i=0; hits=0; fails=0
+          while [ $(date +%s) -lt $end ]; do
+            i=$((i+1))
+            (cd /tmp && timeout 600 $GITHUB_WORKSPACE/$BIN > /tmp/run.$i.log 2>&1); rc=$?
+            a=0; grep -q "update_remap" /tmp/run.$i.log && a=1
+            [ $a = 1 ] && hits=$((hits+1))
+            [ $rc != 0 ] && fails=$((fails+1))
+            echo "RESULT prune=${{ matrix.prune }} load=${{ matrix.load }} run=$i rc=$rc assert=$a"
+            if [ $a = 1 ] || [ $rc != 0 ]; then
+              grep -v "TRunnerCons\|TPool\|TLocklessPool\|SLOW RUNNER\|Scheduler TID" /tmp/run.$i.log | tail -150
+            fi
+            rm -rf /tmp/import_repl_test_*
+          done
+          echo "SUMMARY prune=${{ matrix.prune }} load=${{ matrix.load }} shard=${{ matrix.shard }} runs=$i asserts=$hits fails=$fails"

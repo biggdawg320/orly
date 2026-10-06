@@ -84,6 +84,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <condition_variable>
 #include <deque>
@@ -689,7 +690,7 @@ void OverwriteUntilPruned(const TAddress &master_addr, const string &master_log)
   }
   /* The memory merge flushes the global pov every 40ms and the disk merge runs every 10ms, so
      the overwrites span many files, and a pruning merge follows them closely. */
-  while (CountPruningMerges(master_log) <= pruned_before) {
+  while (!getenv("PRUNE_OFF") && CountPruningMerges(master_log) <= pruned_before) {  // LOOP614
     if (steady_clock::now() >= give_up) {
       throw runtime_error("no disk merge of the global pov dropped any update; see " + master_log);
     }
@@ -769,6 +770,7 @@ string GetOrlyiPath() {
 }  // anonymous namespace
 
 FIXTURE(ImportReplication) {
+  if (getenv("ONLY_PRUNED_JOIN")) { return; }  // LOOP614
   Orly::Type::TTypeCzar type_czar;
   const string scratch = GetScratchDir();
   const string orlyi_path = GetOrlyiPath();
@@ -1015,7 +1017,8 @@ FIXTURE(PrunedJoinWithoutFileSync) {
   log_dumper.Add(master_log);
   TChildServer master(
       MakeServerArgs(orlyi_path, "pruned_join_master", pkg_dir, master_port,
-                     master_slave_port, "SOLO", 0),
+                     master_slave_port, "SOLO", 0,
+                     getenv("PRUNE_OFF") ? vector<string>{"--prune_merge_history=false"} : vector<string>{}),  // LOOP614
       master_log);
   if (!WaitForPort(master_port, seconds(240))) {
     throw runtime_error("master never came up; see " + master_log);
@@ -1074,6 +1077,7 @@ FIXTURE(PrunedJoinWithoutFileSync) {
    TConnection releases the session's durable ptr before Clear() runs,
    instead of Clear() logging-and-leaking the still-ptr'd session (#460). */
 FIXTURE(GracefulShutdownUnresponsiveSlave) {
+  if (getenv("ONLY_PRUNED_JOIN")) { return; }  // LOOP614
   Orly::Type::TTypeCzar type_czar;
   const string scratch = GetScratchDir();
   const string orlyi_path = GetOrlyiPath();
